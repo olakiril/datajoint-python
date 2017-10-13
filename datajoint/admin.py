@@ -1,14 +1,18 @@
 import pymysql
 from . import conn
-from .utils import user_choice
+from getpass import getpass
 
 
-def set_password(new_password, connection=conn()):   # pragma: no cover
-    if 'yes' == user_choice('Do you wish to change the password?'):
-        connection.query("SET PASSWORD = PASSWORD('%s')" % new_password)
-        print('Done!')
-    else:
-        print('Password left unchanged')
+def set_password(new_password=None, connection=None):   # pragma: no cover
+    connection = conn() if connection is None else connection
+    if new_password is None:
+        new_password = getpass('New password: ')
+        confirm_password = getpass('Confirm password: ')
+        if new_password != confirm_password:
+            print('Failed to confirm the password! Aborting password change.')
+            return
+    connection.query("SET PASSWORD = PASSWORD('%s')" % new_password)
+    print('Password updated.')
 
 
 def kill(restriction=None, connection=None):  # pragma: no cover

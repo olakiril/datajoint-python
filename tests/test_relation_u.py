@@ -1,5 +1,5 @@
 from nose.tools import assert_equal, assert_true, raises, assert_list_equal
-from . import schema
+from . import schema, schema_simple
 import datajoint as dj
 
 
@@ -24,7 +24,13 @@ class TestU:
         rel = dj.U('language') & self.language
         assert_list_equal(rel.heading.names, ['language'])
         assert_true(len(rel) == len(language_set))
-        assert_true(set(rel.fetch['language']) == language_set)
+        assert_true(set(rel.fetch('language')) == language_set)
+        # Test for issue #342
+        rel = self.trial*dj.U('start_time')
+        assert_list_equal(rel.primary_key, self.trial.primary_key + ['start_time'])
+        assert_list_equal(rel.primary_key, (rel & 'trial_id>3').primary_key)
+        assert_list_equal((dj.U('start_time') & self.trial).primary_key, ['start_time'])
+
 
     @staticmethod
     @raises(dj.DataJointError)
@@ -52,11 +58,17 @@ class TestU:
     def test_aggregations(self):
         rel = dj.U('language').aggr(schema.Language(), number_of_speakers='count(*)')
         assert_equal(len(rel), len(set(l[1] for l in schema.Language.contents)))
-        assert_equal((rel & 'language="English"').fetch1['number_of_speakers'], 3)
+        assert_equal((rel & 'language="English"').fetch1('number_of_speakers'), 3)
 
     def test_argmax(self):
         rel = schema.Test()
         # get the tuples corresponding to maximum value
         mx = rel & dj.U().aggr(rel, value='max(value)')
-        assert_equal(mx.fetch['value'][0], max(rel.fetch['value']))
+        assert_equal(mx.fetch('value')[0], max(rel.fetch('value')))
 
+    def test_aggr(self):
+        rel = schema_simple.ArgmaxTest()
+        amax1 = (dj.U('val') * rel) & dj.U('secondary_key').aggr(rel, val='min(val)')
+        amax2 = (dj.U('val') * rel) * dj.U('secondary_key').aggr(rel, val='min(val)')
+        assert_true(len(amax1) == len(amax2) == rel.n,
+                    'Aggregated argmax with join and restriction does not yield same length.')

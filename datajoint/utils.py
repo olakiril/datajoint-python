@@ -1,7 +1,6 @@
 import re
 from datajoint import DataJointError
 
-
 class ClassProperty:
     def __init__(self, f):
         self.f = f
@@ -23,7 +22,7 @@ def user_choice(prompt, choices=("yes", "no"), default=None):
     valid = False
     while not valid:
         response = input(prompt + ' [' + choice_list + ']: ')
-        response = response if response else default
+        response = response.lower() if response else default
         valid = response in choices
     return response
 

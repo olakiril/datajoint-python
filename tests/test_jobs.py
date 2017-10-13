@@ -1,11 +1,17 @@
-from nose.tools import assert_true, assert_false
+from nose.tools import assert_true, assert_false, assert_equals
 from . import schema
+from datajoint.jobs import ERROR_MESSAGE_LENGTH, TRUNCATION_APPENDIX
+import random
+import string
 
 
 subjects = schema.Subject()
 
 
 def test_reserve_job():
+    # clean jobs table
+    schema.schema.jobs.delete()
+
     assert_true(subjects)
     table_name = 'fake_table'
     # reserve jobs
@@ -27,12 +33,87 @@ def test_reserve_job():
                     'failed to reserve new jobs')
     # finish with error
     for key in subjects.fetch.keys():
-        schema.schema.jobs.error(table_name, key, "error message")
+        schema.schema.jobs.error(table_name, key,
+                                 "error message")
     # refuse jobs with errors
     for key in subjects.fetch.keys():
         assert_false(schema.schema.jobs.reserve(table_name, key),
                      'failed to ignore error jobs')
     # clear error jobs
-    (schema.schema.jobs & dict(status="error")).delete_quick()
+    (schema.schema.jobs & dict(status="error")).delete()
     assert_false(schema.schema.jobs,
                  'failed to clear error jobs')
+
+
+def test_restrictions():
+    # clear out jobs table
+    jobs = schema.schema.jobs
+    jobs.delete()
+    jobs.reserve('a', {'key': 'a1'})
+    jobs.reserve('a', {'key': 'a2'})
+    jobs.reserve('b', {'key': 'b1'})
+    jobs.error('a', {'key': 'a2'}, 'error')
+    jobs.error('b', {'key': 'b1'}, 'error')
+
+    assert_true(len(jobs & 'table_name = "a"') == 2, 'There should be two entries for table a')
+    assert_true(len(jobs & 'status = "error"') == 2, 'There should be two entries with error status')
+    assert_true(len(jobs & 'table_name = "a"' & 'status = "error"') == 1,
+                'There should be only one entries with error status in table a')
+    jobs.delete()
+
+
+def test_sigint():
+    # clear out job table
+    schema.schema.jobs.delete()
+    try:
+        schema.SigIntTable().populate(reserve_jobs=True)
+    except KeyboardInterrupt:
+        pass
+
+    status, error_message = schema.schema.jobs.fetch1('status', 'error_message')
+    assert_equals(status, 'error')
+    assert_equals(error_message, 'KeyboardInterrupt')
+    schema.schema.jobs.delete()
+
+
+def test_sigterm():
+    # clear out job table
+    schema.schema.jobs.delete()
+    try:
+        schema.SigTermTable().populate(reserve_jobs=True)
+    except SystemExit:
+        pass
+
+    status, error_message = schema.schema.jobs.fetch1('status', 'error_message')
+    assert_equals(status, 'error')
+    assert_equals(error_message, 'SystemExit: SIGTERM received')
+    schema.schema.jobs.delete()
+
+
+def test_long_error_message():
+    # clear out jobs table
+    schema.schema.jobs.delete()
+
+    # create long error message
+    long_error_message = ''.join(random.choice(string.ascii_letters) for _ in range(ERROR_MESSAGE_LENGTH + 100))
+    short_error_message = ''.join(random.choice(string.ascii_letters) for _ in range(ERROR_MESSAGE_LENGTH // 2))
+    assert_true(subjects)
+    table_name = 'fake_table'
+
+    key = list(subjects.fetch.keys())[0]
+
+    # test long error message
+    schema.schema.jobs.reserve(table_name, key)
+    schema.schema.jobs.error(table_name, key, long_error_message)
+    error_message = schema.schema.jobs.fetch1('error_message')
+    assert_true(len(error_message) == ERROR_MESSAGE_LENGTH, 'error message is longer than max allowed')
+    assert_true(error_message.endswith(TRUNCATION_APPENDIX), 'appropriate ending missing for truncated error message')
+    schema.schema.jobs.delete()
+
+    # test long error message
+    schema.schema.jobs.reserve(table_name, key)
+    schema.schema.jobs.error(table_name, key, short_error_message)
+    error_message = schema.schema.jobs.fetch1('error_message')
+    assert_true(error_message == short_error_message, 'error messages do not agree')
+    assert_false(error_message.endswith(TRUNCATION_APPENDIX), 'error message should not be truncated')
+    schema.schema.jobs.delete()

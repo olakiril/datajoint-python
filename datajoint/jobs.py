@@ -3,6 +3,9 @@ import os
 import pymysql
 from .base_relation import BaseRelation
 
+ERROR_MESSAGE_LENGTH = 2047
+TRUNCATION_APPENDIX = '...truncated'
+
 
 def key_hash(key):
     """
@@ -19,15 +22,15 @@ class JobTable(BaseRelation):
     A base relation with no definition. Allows reserving jobs
     """
     def __init__(self, arg, database=None):
-        super().__init__()
         if isinstance(arg, JobTable):
+            super().__init__(arg)
             # copy constructor
             self.database = arg.database
             self._connection = arg._connection
             self._definition = arg._definition
             self._user = arg._user
             return
-
+        super().__init__()
         self.database = database
         self._connection = arg
         self._definition = """    # job reservation table for `{database}`
@@ -36,13 +39,14 @@ class JobTable(BaseRelation):
         ---
         status  :enum('reserved','error','ignore')  # if tuple is missing, the job is available
         key=null  :blob  # structure containing the key
-        error_message=""  :varchar(1023)  # error message returned if failed
+        error_message=""  :varchar({error_message_length})  # error message returned if failed
         error_stack=null  :blob  # error stack if failed
         user="" :varchar(255) # database user
         host=""  :varchar(255)  # system hostname
         pid=0  :int unsigned  # system process id
+        connection_id = 0  : bigint unsigned          # connection_id()
         timestamp=CURRENT_TIMESTAMP  :timestamp   # automatic timestamp
-        """.format(database=database)
+        """.format(database=database, error_message_length=ERROR_MESSAGE_LENGTH)
         if not self.is_declared:
             self.declare()
         self._user = self.connection.get_user()
@@ -77,9 +81,11 @@ class JobTable(BaseRelation):
             status='reserved',
             host=os.uname().nodename,
             pid=os.getpid(),
+            connection_id=self.connection.connection_id,
+            key=key,
             user=self._user)
         try:
-            self.insert1(job)
+            self.insert1(job, ignore_extra_fields=True)
         except pymysql.err.IntegrityError:
             return False
         return True
@@ -101,13 +107,17 @@ class JobTable(BaseRelation):
         :param key: the dict of the job's primary key
         :param error_message: string error message
         """
+        if len(error_message) > ERROR_MESSAGE_LENGTH:
+            error_message = error_message[:ERROR_MESSAGE_LENGTH-len(TRUNCATION_APPENDIX)] + TRUNCATION_APPENDIX
         job_key = dict(table_name=table_name, key_hash=key_hash(key))
         self.insert1(
             dict(job_key,
                  status="error",
                  host=os.uname().nodename,
                  pid=os.getpid(),
+                 connection_id=self.connection.connection_id,
                  user=self._user,
+                 key=key,
                  error_message=error_message), replace=True, ignore_extra_fields=True)
 
 

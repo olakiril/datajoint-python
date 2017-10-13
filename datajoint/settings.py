@@ -1,15 +1,15 @@
 """
 Settings for DataJoint.
 """
-from . import DataJointError
 from contextlib import contextmanager
 import json
+import os
 import pprint
 from collections import OrderedDict
-
 import logging
 import collections
 from enum import Enum
+from . import DataJointError
 
 LOCALCONFIG = 'dj_local_conf.json'
 GLOBALCONFIG = '.datajoint_config.json'
@@ -29,6 +29,7 @@ prefix_to_role = dict(zip(role_to_prefix.values(), role_to_prefix.keys()))
 
 
 server_error_codes = {
+    'unknown column': 1054,
     'command denied': 1142,
     'tables does not exist': 1146,
     'syntax error': 1149
@@ -37,22 +38,19 @@ server_error_codes = {
 
 default = OrderedDict({
     'database.host': 'localhost',
-    'database.password': 'datajoint',
-    'database.user': 'datajoint',
+    'database.password': None,
+    'database.user': None,
     'database.port': 3306,
-    'database.reconnect': False,
-    #
     'connection.init_function': None,
-    #
+    'database.reconnect': False,
     'loglevel': 'INFO',
-    #
     'safemode': True,
-    #
     'display.limit': 7,
-    'display.width': 14
+    'display.width': 14,
+    'display.show_tuple_count': True
 })
 
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 log_levels = {
     'INFO': logging.INFO,
     'WARNING': logging.WARNING,
@@ -61,7 +59,6 @@ log_levels = {
     'ERROR': logging.ERROR,
     None:  logging.NOTSET
 }
-
 
 
 class Config(collections.MutableMapping):
@@ -73,6 +70,9 @@ class Config(collections.MutableMapping):
                 Config.instance = Config.__Config(*args, **kwargs)
             else:
                 Config.instance._conf.update(dict(*args, **kwargs))
+
+    def add_history(self, item):
+        self.update({'history': self.get('history', []) + [item]})
 
     def __getattr__(self, name):
         return getattr(self.instance, name)
@@ -98,6 +98,36 @@ class Config(collections.MutableMapping):
     def __len__(self):
         return len(self.instance._conf)
 
+    def save(self, filename):
+        """
+        Saves the settings in JSON format to the given file path.
+        :param filename: filename of the local JSON settings file.
+        """
+        with open(filename, 'w') as fid:
+            json.dump(self._conf, fid, indent=4)
+
+    def load(self, filename):
+        """
+        Updates the setting from config file in JSON format.
+        :param filename: filename of the local JSON settings file. If None, the local config file is used.
+        """
+        if filename is None:
+            filename = LOCALCONFIG
+        with open(filename, 'r') as fid:
+            self._conf.update(json.load(fid))
+        self.add_history('Updated from config file: %s' % filename)
+
+    def save_local(self):
+        """
+        saves the settings in the local config file
+        """
+        self.save(LOCALCONFIG)
+
+    def save_global(self):
+        """
+        saves the settings in the global config file
+        """
+        self.save(os.path.expanduser(os.path.join('~', GLOBALCONFIG)))
 
     @contextmanager
     def __call__(self, **kwargs):
@@ -107,17 +137,15 @@ class Config(collections.MutableMapping):
         double underscore '__'. The context manager yields the changed config object.
 
         Example:
-
         >>> import datajoint as dj
-        >>> with dj.config(safe__mode=False) as cfg:
+        >>> with dj.config(safemode=False, database__host="localhost") as cfg:
         >>>     # do dangerous stuff here
-
         """
 
         try:
             backup = self.instance
             self.instance = Config.__Config(self.instance._conf)
-            new = {k.replace('__','.'):v for k,v in kwargs.items()}
+            new = {k.replace('__', '.'): v for k, v in kwargs.items()}
             self.instance._conf.update(new)
             yield self
         except:
@@ -126,7 +154,6 @@ class Config(collections.MutableMapping):
         else:
             self.instance = backup
 
-
     class __Config:
         """
         Stores datajoint settings. Behaves like a dictionary, but applies validator functions
@@ -134,7 +161,6 @@ class Config(collections.MutableMapping):
 
         The default parameters are stored in datajoint.settings.default . If a local config file
         exists, the settings specified in this file override the default settings.
-
         """
 
         def __init__(self, *args, **kwargs):
@@ -152,28 +178,3 @@ class Config(collections.MutableMapping):
                 self._conf[key] = value
             else:
                 raise DataJointError(u'Validator for {0:s} did not pass'.format(key, ))
-
-        def save(self, filename=None):
-            """
-            Saves the settings in JSON format to the given file path.
-            :param filename: filename of the local JSON settings file. If None, the local config file is used.
-            """
-            if filename is None:
-                filename = LOCALCONFIG
-            with open(filename, 'w') as fid:
-                json.dump(self._conf, fid, indent=4)
-
-        def load(self, filename):
-            """
-            Updates the setting from config file in JSON format.
-
-            :param filename=None: filename of the local JSON settings file. If None, the local config file is used.
-            """
-            if filename is None:
-                filename = LOCALCONFIG
-            with open(filename, 'r') as fid:
-                self._conf.update(json.load(fid))
-
-
-
-

@@ -6,6 +6,7 @@ import warnings
 from contextlib import contextmanager
 import pymysql as client
 import logging
+from getpass import getpass
 
 from . import config
 from . import DataJointError
@@ -16,7 +17,7 @@ from pymysql import err
 logger = logging.getLogger(__name__)
 
 
-def conn(host=None, user=None, passwd=None, init_fun=None, reset=False):
+def conn(host=None, user=None, password=None, init_fun=None, reset=False):
     """
     Returns a persistent connection object to be shared by multiple modules.
     If the connection is not yet established or reset=True, a new connection is set up.
@@ -26,18 +27,20 @@ def conn(host=None, user=None, passwd=None, init_fun=None, reset=False):
 
     :param host: hostname
     :param user: mysql user
-    :param passwd: mysql password
+    :param password: mysql password
     :param init_fun: initialization function
-    :param reset: whether the connection should be reseted or not
+    :param reset: whether the connection should be reset or not
     """
     if not hasattr(conn, 'connection') or reset:
         host = host if host is not None else config['database.host']
         user = user if user is not None else config['database.user']
-        passwd = passwd if passwd is not None else config['database.password']
-        if passwd is None:  # pragma: no cover
-            passwd = input("Please enter database password: ")
+        password = password if password is not None else config['database.password']
+        if user is None:  # pragma: no cover
+            user = input("Please enter DataJoint username: ")
+        if password is None:  # pragma: no cover
+            password = getpass(prompt="Please enter DataJoint password: ")
         init_fun = init_fun if init_fun is not None else config['connection.init_function']
-        conn.connection = Connection(host, user, passwd, init_fun)
+        conn.connection = Connection(host, user, password, init_fun)
     return conn.connection
 
 
@@ -50,22 +53,24 @@ class Connection:
 
     :param host: host name
     :param user: user name
-    :param passwd: password
-    :param init_fun: initialization function
+    :param password: password
+    :param init_fun: connection initialization function (SQL)
     """
 
-    def __init__(self, host, user, passwd, init_fun=None):
+    def __init__(self, host, user, password, init_fun=None):
         if ':' in host:
             host, port = host.split(':')
             port = int(port)
         else:
             port = config['database.port']
-        self.conn_info = dict(host=host, port=port, user=user, passwd=passwd)
+        self.conn_info = dict(host=host, port=port, user=user, passwd=password)
         self.init_fun = init_fun
         print("Connecting {user}@{host}:{port}".format(**self.conn_info))
+        self._conn = None
         self.connect()
         if self.is_connected:
             logger.info("Connected {user}@{host}:{port}".format(**self.conn_info))
+            self.connection_id = self.query('SELECT connection_id()').fetchone()[0]
         else:
             raise DataJointError('Connection failed.')
         self._conn.autocommit(True)
@@ -82,11 +87,9 @@ class Connection:
         return "DataJoint connection ({connected}) {user}@{host}:{port}".format(
             connected=connected, **self.conn_info)
 
-    def connect(self, init_fun=None):
+    def connect(self):
         """
         Connects to the database server.
-
-        :param init_fun: initialization function passed to pymysql
         """
         self._conn = client.connect(init_command=self.init_fun, **self.conn_info)
 
@@ -109,13 +112,17 @@ class Connection:
         :param as_dict: If as_dict is set to True, the returned cursor objects returns
                         query results as dictionary.
         """
+
         cursor = client.cursors.DictCursor if as_dict else client.cursors.Cursor
         cur = self._conn.cursor(cursor=cursor)
 
-        # Log the query
         try:
+            # Log the query
             logger.debug("Executing SQL:" + query[0:300])
-            cur.execute(query, args)
+            # suppress all warnings arising from underlying SQL library
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                cur.execute(query, args)
         except err.OperationalError as e:
             if 'MySQL server has gone away' in str(e) and config['database.reconnect']:
                 warnings.warn('''Mysql server has gone away.
@@ -127,6 +134,10 @@ class Connection:
                 cur.execute(query, args)
             else:
                 raise
+        except err.ProgrammingError as e:
+            print('Error in query:')
+            print(query)
+            raise
         return cur
 
     def get_user(self):
@@ -198,6 +209,3 @@ class Connection:
             raise
         else:
             self.commit_transaction()
-
-
-

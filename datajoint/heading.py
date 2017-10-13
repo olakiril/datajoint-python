@@ -1,7 +1,10 @@
 import numpy as np
-from . import DataJointError
 from collections import namedtuple, OrderedDict
 import re
+import logging
+from . import DataJointError
+
+logger = logging.getLogger(__name__)
 
 default_attribute_properties = dict(    # these default values are set in computed attributes
     name=None, type='expression', in_key=False, nullable=False, default=None, comment='calculated attribute',
@@ -127,8 +130,12 @@ class Heading:
         info = conn.query('SHOW TABLE STATUS FROM `{database}` WHERE name="{table_name}"'.format(
             table_name=table_name, database=database), as_dict=True).fetchone()
         if info is None:
-            raise DataJointError('The table `{database}`.`{table_name}` is not defined.'.format(
-                table_name=table_name, database=database))
+            if table_name == '~log':
+                logger.warning('Could not create the ~log table')
+                return
+            else:
+                raise DataJointError('The table `{database}`.`{table_name}` is not defined.'.format(
+                    table_name=table_name, database=database))
         self.table_info = {k.lower(): v for k, v in info.items()}
 
         cur = conn.query(
@@ -153,18 +160,18 @@ class Heading:
                       for x in attributes]
 
         numeric_types = {
-            ('float', False): np.float32,
-            ('float', True): np.float32,
+            ('float', False): np.float64,
+            ('float', True): np.float64,
             ('double', False): np.float64,
             ('double', True): np.float64,
-            ('tinyint', False): np.int8,
-            ('tinyint', True): np.uint8,
-            ('smallint', False): np.int16,
-            ('smallint', True): np.uint16,
-            ('mediumint', False): np.int32,
-            ('mediumint', True): np.uint32,
-            ('int', False): np.int32,
-            ('int', True): np.uint32,
+            ('tinyint', False): np.int64,
+            ('tinyint', True): np.int64,
+            ('smallint', False): np.int64,
+            ('smallint', True): np.int64,
+            ('mediumint', False): np.int64,
+            ('mediumint', True): np.int64,
+            ('int', False): np.int64,
+            ('int', True): np.int64,
             ('bigint', False): np.int64,
             ('bigint', True): np.uint64
             }
@@ -207,25 +214,33 @@ class Heading:
                     attr['dtype'] = numeric_types[(t, is_unsigned)]
         self.attributes = OrderedDict([(q['name'], Attribute(**q)) for q in attributes])
 
-    def project(self, attribute_list, named_attributes, force_primary_key=None):
+    def project(self, attribute_list, named_attributes=None, force_primary_key=None):
         """
         derive a new heading by selecting, renaming, or computing attributes.
         In relational algebra these operators are known as project, rename, and extend.
+        :param attribute_list:  the full list of existing attributes to include
+        :param force_primary_key:  attributes to force to be converted to primary
+        :param named_attributes:  dictionary of renamed attributes
         """
         try:  # check for missing attributes
             raise DataJointError('Attribute `%s` is not found' % next(a for a in attribute_list if a not in self.names))
         except StopIteration:
+            if named_attributes is None:
+                named_attributes = {}
+            if force_primary_key is None:
+                force_primary_key = set()
             return Heading(
-                [dict(v.todict(), **dict(
-                    () if force_primary_key is None else [('in_key', k in force_primary_key)]))
-                 for k, v in self.attributes.items() if k in attribute_list] +
-                [dict(  # rename attribute
+                [dict(   # copied attributes
+                    self.attributes[k].todict(),
+                    in_key=self.attributes[k].in_key or k in force_primary_key)
+                 for k in attribute_list] +
+                [dict(  # renamed attributes
                     self.attributes[sql_expression].todict(),
                     name=new_name,
-                    sql_expression='`' + sql_expression + '`',
-                    **dict(() if force_primary_key is None else [('in_key', sql_expression in force_primary_key)]))
+                    sql_expression='`%s`' % sql_expression,
+                    in_key=self.attributes[sql_expression].in_key or sql_expression in force_primary_key)
                  if sql_expression in self.names else
-                 dict(  # compute attribute
+                 dict(  # computed attributes
                      default_attribute_properties,
                      name=new_name,
                      sql_expression=sql_expression)

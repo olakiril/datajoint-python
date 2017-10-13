@@ -66,46 +66,38 @@ class BaseRelation(RelationalOperand):
         """
         return self.full_table_name
 
-    @property
-    def select_fields(self):
+    def get_select_fields(self, select_fields=None):
         """
         :return: the selected attributes from the SQL SELECT statement.
         """
-        return '*'
+        return '*' if select_fields is None else self.heading.project(select_fields).as_sql
 
     def parents(self, primary=None):
         """
         :param primary: if None, then all parents are returned. If True, then only foreign keys composed of
             primary key attributes are considered.  If False, the only foreign keys including at least one non-primary
             attribute are considered.
-
-        :return: list of tables referenced with self's foreign keys
-
+        :return: dict of tables referenced with self's foreign keys
         """
-        return [p[0] for p in self.connection.dependencies.in_edges(self.full_table_name, data=True)
-                if primary is None or p[2]['primary'] == primary]
+        return self.connection.dependencies.parents(self.full_table_name, primary)
 
     def children(self, primary=None):
         """
         :param primary: if None, then all parents are returned. If True, then only foreign keys composed of
             primary key attributes are considered.  If False, the only foreign keys including at least one non-primary
             attribute are considered.
-
-        :return: list of tables with foreign keys referencing self
-
+        :return: dict of tables with foreign keys referencing self
         """
-        return [p[1] for p in self.connection.dependencies.out_edges(self.full_table_name, data=True)
-                if primary is None or p[2]['primary'] == primary]
+        return self.connection.dependencies.children(self.full_table_name, primary)
 
     @property
     def is_declared(self):
         """
         :return: True is the table is declared in the database
         """
-        cur = self.connection.query(
-            'SHOW TABLES in `{database}`LIKE "{table_name}"'.format(
-                database=self.database, table_name=self.table_name))
-        return cur.rowcount > 0
+        return self.connection.query(
+            'SHOW TABLES in `{database}` LIKE "{table_name}"'.format(
+                database=self.database, table_name=self.table_name)).rowcount > 0
 
     @property
     def full_table_name(self):
@@ -146,16 +138,34 @@ class BaseRelation(RelationalOperand):
         """
 
         if isinstance(rows, RelationalOperand):
-            # INSERT FROM SELECT
-            query = 'INSERT{ignore} INTO {table} ({fields}) {select}'.format(
+            # INSERT FROM SELECT - build alternate field-narrowing query (only) when needed
+            if ignore_extra_fields and not all(name in self.heading.names for name in rows.heading.names):
+                query = 'INSERT{ignore} INTO {table} ({fields}) SELECT {fields} FROM ({select}) as `__alias`'.format(
+                ignore=" IGNORE" if ignore_errors or skip_duplicates else "",
+                table=self.full_table_name,
+                fields='`'+'`,`'.join(self.heading.names)+'`',
+                select=rows.make_sql())
+            else:
+                query = 'INSERT{ignore} INTO {table} ({fields}) {select}'.format(
                 ignore=" IGNORE" if ignore_errors or skip_duplicates else "",
                 table=self.full_table_name,
                 fields='`'+'`,`'.join(rows.heading.names)+'`',
                 select=rows.make_sql())
-            self.connection.query(query)
+            try:
+                self.connection.query(query)
+            except pymysql.err.InternalError as err:
+                if err.args[0] == server_error_codes['unknown column']:
+                    # args[1] -> Unknown column 'extra' in 'field list'
+                    raise DataJointError('%s : To ignore extra fields, set ignore_extra_fields=True in insert.' % err.args[1])
+                else:
+                    raise
             return
 
         heading = self.heading
+        if heading.attributes is None:
+            logger.warning('Could not access table {table}'.format(table=self.full_table_name))
+            return
+
         field_list = None  # ensures that all rows have the same attributes in the same order as the first row.
 
         def make_row_to_insert(row):
@@ -178,7 +188,7 @@ class BaseRelation(RelationalOperand):
                     value = pack(value)
                     placeholder = '%s'
                 elif heading[name].numeric:
-                    if value is None or np.isnan(np.float(value)):  # nans are turned into NULLs
+                    if value is None or value == '' or np.isnan(np.float(value)):  # nans are turned into NULLs
                         placeholder = 'NULL'
                         value = None
                     else:
@@ -239,13 +249,19 @@ class BaseRelation(RelationalOperand):
 
         rows = list(make_row_to_insert(row) for row in rows)
         if rows:
-            self.connection.query(
-                "{command} INTO {destination}(`{fields}`) VALUES {placeholders}".format(
-                    command='REPLACE' if replace else 'INSERT IGNORE' if ignore_errors or skip_duplicates else 'INSERT',
-                    destination=self.from_clause,
-                    fields='`,`'.join(field_list),
-                    placeholders=','.join('(' + ','.join(row['placeholders']) + ')' for row in rows)),
-                args=list(itertools.chain.from_iterable((v for v in r['values'] if v is not None) for r in rows)))
+            try:
+                self.connection.query(
+                    "{command} INTO {destination}(`{fields}`) VALUES {placeholders}".format(
+                        command='REPLACE' if replace else 'INSERT IGNORE' if ignore_errors or skip_duplicates else 'INSERT',
+                        destination=self.from_clause,
+                        fields='`,`'.join(field_list),
+                        placeholders=','.join('(' + ','.join(row['placeholders']) + ')' for row in rows)),
+                    args=list(itertools.chain.from_iterable((v for v in r['values'] if v is not None) for r in rows)))
+            except pymysql.err.OperationalError as err:
+                if err.args[0] == server_error_codes['command denied']:
+                    raise DataJointError('Command denied:  %s' % err.args[1])
+                else:
+                    raise
 
     def delete_quick(self):
         """
@@ -254,59 +270,80 @@ class BaseRelation(RelationalOperand):
         """
         query = 'DELETE FROM ' + self.full_table_name + self.where_clause
         self.connection.query(query)
-        self._log(query[0:255])
+        self._log(query[:255])
 
     def delete(self):
         """
         Deletes the contents of the table and its dependent tables, recursively.
         User is prompted for confirmation if config['safemode'] is set to True.
         """
-        self.connection.dependencies.load()
-
-        relations_to_delete = collections.OrderedDict(
-            (r, FreeRelation(self.connection, r))
-            for r in self.connection.dependencies.descendants(self.full_table_name))
+        graph = self.connection.dependencies
+        graph.load()
+        delete_list = collections.OrderedDict()
+        for table in graph.descendants(self.full_table_name):
+            if not table.isdigit():
+                delete_list[table] = FreeRelation(self.connection, table)
+            else:
+                parent, edge = next(iter(graph.parents(table).items()))
+                delete_list[table] = FreeRelation(self.connection, parent).proj(
+                    **{new_name: old_name
+                       for new_name, old_name in zip(edge['referencing_attributes'], edge['referenced_attributes'])
+                       if new_name != old_name})
 
         # construct restrictions for each relation
         restrict_by_me = set()
         restrictions = collections.defaultdict(list)
+        # restrict by self
         if self.restrictions:
             restrict_by_me.add(self.full_table_name)
-            restrictions[self.full_table_name].append(self.restrictions)  # copy own restrictions
-        for r in relations_to_delete.values():
-            restrict_by_me.update(r.children(primary=False))
-        for name, r in relations_to_delete.items():
-            for dep in r.children():
-                if name in restrict_by_me:
-                    restrictions[dep].append(r)
+            restrictions[self.full_table_name].append(self.restrictions.simplify())  # copy own restrictions
+        # restrict by renamed nodes
+        restrict_by_me.update(table for table in delete_list if table.isdigit())  # restrict by all renamed nodes
+        # restrict by tables restricted by a non-primary semijoin
+        for table in delete_list:
+            restrict_by_me.update(graph.children(table, primary=False))   # restrict by any non-primary dependents
+
+        # compile restriction lists
+        for table, rel in delete_list.items():
+            for dep in graph.children(table):
+                if table in restrict_by_me:
+                    restrictions[dep].append(rel)   # if restrict by me, then restrict by the entire relation
                 else:
-                    restrictions[dep].extend(restrictions[name])
+                    restrictions[dep].extend(restrictions[table])   # or re-apply the same restrictions
 
         # apply restrictions
-        for name, r in relations_to_delete.items():
+        for name, r in delete_list.items():
             if restrictions[name]:  # do not restrict by an empty list
                 r.restrict([r.proj() if isinstance(r, RelationalOperand) else r
-                            for r in restrictions[name]])  # project
+                            for r in restrictions[name]])
         # execute
         do_delete = False  # indicate if there is anything to delete
         if config['safemode']:  # pragma: no cover
             print('The contents of the following tables are about to be deleted:')
-        for relation in list(relations_to_delete.values()):
-            count = len(relation)
-            if count:
-                do_delete = True
-                if config['safemode']:
-                    print(relation.full_table_name, '(%d tuples)' % count)
+
+        for table, relation in list(delete_list.items()):   # need list to force a copy
+            if table.isdigit():
+                delete_list.pop(table)  # remove alias nodes from the delete list
             else:
-                relations_to_delete.pop(relation.full_table_name)
+                count = len(relation)
+                if count:
+                    do_delete = True
+                    if config['safemode']:
+                        print(table, '(%d tuples)' % count)
+                else:
+                    delete_list.pop(table)
         if not do_delete:
             if config['safemode']:
                 print('Nothing to delete')
         else:
             if not config['safemode'] or user_choice("Proceed?", default='no') == 'yes':
-                with self.connection.transaction:
-                    for r in reversed(list(relations_to_delete.values())):
-                        r.delete_quick()
+                already_in_transaction = self.connection._in_transaction
+                if not already_in_transaction:
+                    self.connection.start_transaction()
+                for r in reversed(list(delete_list.values())):
+                    r.delete_quick()
+                if not already_in_transaction:
+                    self.connection.commit_transaction()
                 print('Done')
 
     def drop_quick(self):
@@ -318,7 +355,7 @@ class BaseRelation(RelationalOperand):
             query = 'DROP TABLE %s' % self.full_table_name
             self.connection.query(query)
             logger.info("Dropped table %s" % self.full_table_name)
-            self._log(query[0:255])
+            self._log(query[:255])
         else:
             logger.info("Nothing to drop: table %s is not declared" % self.full_table_name)
 
@@ -329,7 +366,8 @@ class BaseRelation(RelationalOperand):
         """
         self.connection.dependencies.load()
         do_drop = True
-        tables = self.connection.dependencies.descendants(self.full_table_name)
+        tables = [table for table in self.connection.dependencies.descendants(self.full_table_name)
+                  if not table.isdigit()]
         if config['safemode']:
             for table in tables:
                 print(table, '(%d tuples)' % len(FreeRelation(self.connection, table)))
@@ -350,28 +388,49 @@ class BaseRelation(RelationalOperand):
         return ret['Data_length'] + ret['Index_length']
 
     def show_definition(self):
+        logger.warning('show_definition is deprecated.  Use describe instead.')
+        return self.describe()
+
+    def describe(self):
         """
         :return:  the definition string for the relation using DataJoint DDL.
             This does not yet work for aliased foreign keys.
         """
         self.connection.dependencies.load()
-        parents = {r: FreeRelation(self.connection, r).primary_key for r in self.parents()}
+        parents = self.parents()
         in_key = True
         definition = '# ' + self.heading.table_info['comment'] + '\n'
         attributes_thus_far = set()
+        attributes_declared = set()
         for attr in self.heading.attributes.values():
             if in_key and not attr.in_key:
                 definition += '---\n'
                 in_key = False
             attributes_thus_far.add(attr.name)
             do_include = True
-            for parent, primary_key in list(parents.items()):
-                if attr.name in primary_key:
+            for parent_name, fk_props in list(parents.items()):  # need list() to force a copy
+                if attr.name in fk_props['referencing_attributes']:
                     do_include = False
-                if attributes_thus_far.issuperset(primary_key):
-                    parents.pop(parent)
-                    definition += '-> ' + (lookup_class_name(parent, self.context) or parent) + '\n'
+                    if attributes_thus_far.issuperset(fk_props['referencing_attributes']):
+                        # simple foreign keys
+                        parents.pop(parent_name)
+                        if not parent_name.isdigit():
+                            definition += '-> {class_name}\n'.format(
+                                class_name=lookup_class_name(parent_name, self.context) or parent_name)
+                        else:
+                            # aliased foreign key
+                            parent_name = self.connection.dependencies.in_edges(parent_name)[0][0]
+                            lst = [(attr, ref) for attr, ref in zip(
+                                fk_props['referencing_attributes'], fk_props['referenced_attributes'])
+                                   if ref != attr]
+                            definition += '({attr_list}) -> {class_name}{ref_list}\n'.format(
+                                attr_list=','.join(r[0] for r in lst),
+                                class_name=lookup_class_name(parent_name, self.context) or parent_name,
+                                ref_list=('' if len(attributes_thus_far) - len(attributes_declared) == 1
+                                          else '(%s)' % ','.join(r[1] for r in lst)))
+                            attributes_declared.update(fk_props['referencing_attributes'])
             if do_include:
+                attributes_declared.add(attr.name)
                 definition += '%-20s : %-28s # %s\n' % (
                     attr.name if attr.default is None else '%s=%s' % (attr.name, attr.default),
                     '%s%s' % (attr.type, 'auto_increment' if attr.autoincrement else ''), attr.comment)
@@ -530,11 +589,14 @@ class Log(BaseRelation):
         return '~log'
 
     def __call__(self, event):
-        self.insert1(dict(
-            user=self._user,
-            version=version + 'py',
-            host=platform.uname().node,
-            event=event), ignore_errors=True, ignore_extra_fields=True)
+        try:
+            self.insert1(dict(
+                user=self._user,
+                version=version + 'py',
+                host=platform.uname().node,
+                event=event), ignore_errors=True, ignore_extra_fields=True)
+        except pymysql.err.OperationalError:
+            logger.info('could not log event in table ~log')
 
     def delete(self):
         """bypass interactive prompts and cascading dependencies"""

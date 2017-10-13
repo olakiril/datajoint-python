@@ -4,13 +4,31 @@ import logging
 import inspect
 import re
 from . import conn, DataJointError, config
+from .erd import ERD
 from .heading import Heading
 from .utils import user_choice, to_camel_case
 from .user_relations import Part, Computed, Imported, Manual, Lookup
-from .view import _View as View
 from .base_relation import lookup_class_name, Log
 
 logger = logging.getLogger(__name__)
+
+
+def ordered_dir(klass):
+    """
+    List (most) attributes of the class including inherited ones, similar to `dir` build-in function,
+    but respects order of attribute declaration as much as possible.
+    :param klass: class to list members for
+    :return: a list of attributes declared in klass and its superclasses
+    """
+    m = []
+    mro = klass.mro()
+    for c in mro:
+        if hasattr(c, '_ordered_class_members'):
+            elements = c._ordered_class_members
+        else:
+            elements = c.__dict__.keys()
+        m = [e for e in elements if e not in m] + m
+    return m
 
 
 class Schema:
@@ -19,7 +37,7 @@ class Schema:
     It also specifies the namespace `context` in which other UserRelation classes are defined.
     """
 
-    def __init__(self, database, context, connection=None):
+    def __init__(self, database, context, connection=None, create_tables=True):
         """
         Associates the specified database with this schema object. If the target database does not exist
         already, will attempt on creating the database.
@@ -34,19 +52,24 @@ class Schema:
         self.database = database
         self.connection = connection
         self.context = context
+        self.create_tables = create_tables
         if not self.exists:
-            # create database
-            logger.info("Database `{database}` could not be found. "
-                        "Attempting to create the database.".format(database=database))
-            try:
-                connection.query("CREATE DATABASE `{database}`".format(database=database))
-                logger.info('Created database `{database}`.'.format(database=database))
-            except pymysql.OperationalError:
-                raise DataJointError("Database named `{database}` was not defined, and"
-                                     " an attempt to create has failed. Check"
-                                     " permissions.".format(database=database))
+            if not self.create_tables:
+                raise DataJointError("Database named `{database}` was not defined. "
+                                     "Set the create_tables flag to create it.".format(database=database))
             else:
-                self.log('created')
+                # create database
+                logger.info("Database `{database}` could not be found. "
+                            "Attempting to create the database.".format(database=database))
+                try:
+                    connection.query("CREATE DATABASE `{database}`".format(database=database))
+                    logger.info('Created database `{database}`.'.format(database=database))
+                except pymysql.OperationalError:
+                    raise DataJointError("Database named `{database}` was not defined, and"
+                                         " an attempt to create has failed. Check"
+                                         " permissions.".format(database=database))
+                else:
+                    self.log('created')
         self.log('connect')
         connection.register(self)
 
@@ -60,6 +83,17 @@ class Schema:
         return 'Schema database: `{database}` in module: {context}\n'.format(
             database=self.database,
             context=self.context['__name__'] if '__name__' in self.context else "__")
+
+    @property
+    def size_on_disk(self):
+        """
+        :return: size of the database in bytes
+        """
+        return int(self.connection.query(
+            """
+            SELECT Sum(data_length + index_length)
+            FROM information_schema.tables WHERE table_schema='{db}'
+            """.format(db=self.database)).fetchone()[0])
 
     def spawn_missing_classes(self):
         """
@@ -96,13 +130,14 @@ class Schema:
             self.process_relation_class(part_class, context=self.context, assert_declared=True)
             setattr(master_class, class_name, part_class)
 
-    def drop(self):
+    def drop(self, force=False):
         """
         Drop the associated database if it exists
         """
         if not self.exists:
             logger.info("Database named `{database}` does not exist. Doing nothing.".format(database=self.database))
         elif (not config['safemode'] or
+              force or
               user_choice("Proceed to delete entire schema `%s`?" % self.database, default='no') == 'yes'):
             logger.info("Dropping `{database}`.".format(database=self.database))
             try:
@@ -128,13 +163,16 @@ class Schema:
         relation_class._connection = self.connection
         relation_class._heading = Heading()
         relation_class._context = context
-        # instantiate the class, declare the table if not already, and fill it with initial values.
+        # instantiate the class, declare the table if not already
         instance = relation_class()
         if not instance.is_declared:
-            assert not assert_declared, 'incorrect table name generation'
-            instance.declare()
-        if instance.is_declared and hasattr(instance, 'contents'):
-            # process the contents attribute
+            if not self.create_tables or assert_declared:
+                raise DataJointError('Table not declared %s' % instance.table_name)
+            else:
+                instance.declare()
+
+        # fill values in Lookup tables from their contents property
+        if instance.is_declared and hasattr(instance, 'contents') and isinstance(instance, Lookup):
             contents = list(instance.contents)
             if len(contents) > len(instance):
                 if instance.heading.has_autoincrement:
@@ -152,21 +190,23 @@ class Schema:
 
         if issubclass(cls, Part):
             raise DataJointError('The schema decorator should not be applied to Part relations')
+        ext = {
+            cls.__name__: cls,
+            'self': cls}
+        self.process_relation_class(cls, context=dict(self.context, **ext))
 
-        if issubclass(cls, View):
-            cls.database = self.database
-            cls._connection = self.connection
-            cls().declare()
-        else:
-            self.process_relation_class(cls, context=self.context)
-            # Process part relations
-            for part in cls._ordered_class_members:
-                if part[0].isupper():
-                    part = getattr(cls, part)
-                    if inspect.isclass(part) and issubclass(part, Part):
-                        part._master = cls
-                        # allow addressing master
-                        self.process_relation_class(part, context=dict(self.context, **{cls.__name__: cls}))
+        # Process part relations
+        for part in ordered_dir(cls):
+            if part[0].isupper():
+                part = getattr(cls, part)
+                if inspect.isclass(part) and issubclass(part, Part):
+                    part._master = cls
+                    # allow addressing master by name or keyword 'master'
+                    ext = {
+                        cls.__name__: cls,
+                        'master': cls,
+                        'self': part}
+                    self.process_relation_class(part, context=dict(self.context, **ext))
         return cls
 
     @property
@@ -176,4 +216,11 @@ class Schema:
         :return: jobs relation
         """
         return self.connection.jobs[self.database]
+
+    def erd(self):
+        # get the caller's locals()
+        import inspect
+        frame = inspect.currentframe()
+        context = frame.f_back.f_locals
+        return ERD(self, context=context)
 

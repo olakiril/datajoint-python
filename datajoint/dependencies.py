@@ -1,11 +1,12 @@
 import pyparsing as pp
 import networkx as nx
+import itertools
 from . import DataJointError
 
 
 class Dependencies(nx.DiGraph):
     """
-    Lookup for dependencies between tables
+    The graph of dependencies (foreign keys) between loaded tables.
     """
     __primary_key_parser = (pp.CaselessLiteral('PRIMARY KEY') +
                             pp.QuotedString('(', endQuoteChar=')').setResultsName('primary_key'))
@@ -13,6 +14,7 @@ class Dependencies(nx.DiGraph):
     def __init__(self, connection):
         self._conn = connection
         self.loaded_tables = set()
+        self._node_alias_count = itertools.count()
         super().__init__(self)
 
     @staticmethod
@@ -56,8 +58,22 @@ class Dependencies(nx.DiGraph):
             except pp.ParseException:
                 pass
             else:
-                self.add_edge(result.referenced_table, table_name,
-                              primary=all(r.strip('` ') in primary_key for r in result.attributes.split(',')))
+                referencing_attributes = [r.strip('` ') for r in result.attributes.split(',')]
+                referenced_attributes = [r.strip('` ') for r in result.referenced_attributes.split(',')]
+                props = dict(
+                    primary=all(a in primary_key for a in referencing_attributes),
+                    referencing_attributes=referencing_attributes,
+                    referenced_attributes=referenced_attributes,
+                    aliased=not all(a == b for a, b in zip(referencing_attributes, referenced_attributes)),
+                    multi=not all(a in referencing_attributes for a in primary_key))
+                if not props['aliased']:
+                    self.add_edge(result.referenced_table, table_name, **props)
+                else:
+                    # for aliased dependencies, add an extra node in the format '1', '2', etc
+                    alias_node = '%d' % next(self._node_alias_count)
+                    self.add_node(alias_node)
+                    self.add_edge(result.referenced_table, alias_node, **props)
+                    self.add_edge(alias_node, table_name, **props)
 
     def load(self, target=None):
         """
@@ -75,6 +91,28 @@ class Dependencies(nx.DiGraph):
                         self.add_table('`{db}`.`{tab}`'.format(db=database, tab=table))
         if not nx.is_directed_acyclic_graph(self):  # pragma: no cover
             raise DataJointError('DataJoint can only work with acyclic dependencies')
+
+    def parents(self, table_name, primary=None):
+        """
+        :param table_name: `schema`.`table`
+        :param primary: if None, then all parents are returned. If True, then only foreign keys composed of
+            primary key attributes are considered.  If False, the only foreign keys including at least one non-primary
+            attribute are considered.
+        :return: dict of tables referenced by the foreign keys of table
+        """
+        return dict(p[::2] for p in self.in_edges(table_name, data=True)
+                    if primary is None or p[2]['primary'] == primary)
+
+    def children(self, table_name, primary=None):
+        """
+        :param table_name: `schema`.`table`
+        :param primary: if None, then all children are returned. If True, then only foreign keys composed of
+            primary key attributes are considered.  If False, the only foreign keys including at least one non-primary
+            attribute are considered.
+        :return: dict of tables referencing the table through foreign keys
+        """
+        return dict(p[1:3] for p in self.out_edges(table_name, data=True)
+                    if primary is None or p[2]['primary'] == primary)
 
     def descendants(self, full_table_name):
         """

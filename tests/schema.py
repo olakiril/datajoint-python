@@ -5,19 +5,32 @@ Sample schema with realistic tables for testing
 import random
 import numpy as np
 import datajoint as dj
+import os, signal
 from . import PREFIX, CONN_INFO
 
 schema = dj.schema(PREFIX + '_test1', locals(), connection=dj.conn(**CONN_INFO))
 
 
 @schema
-class Test(dj.Computed):
-    definition="""
+class Test(dj.Lookup):
+    definition = """
     key   :   int     # key
     ---
     value   :   int     # value
     """
     contents = [(k, 2*k) for k in range(10)]
+
+
+@schema
+class TestExtra(dj.Manual):
+    ''' clone of Test but with an extra field '''
+    definition = Test.definition + "\nextra : int # extra int\n"
+
+
+@schema
+class TestNoExtra(dj.Manual):
+    ''' clone of Test but with no extra fields '''
+    definition = Test.definition
 
 
 @schema
@@ -42,7 +55,7 @@ class User(dj.Lookup):
 
 
 @schema
-class Subject(dj.Manual):
+class Subject(dj.Lookup):
     definition = """  # Basic information about animal subjects used in experiments
     subject_id   :int  #  unique subject id
     ---
@@ -76,11 +89,6 @@ class Language(dj.Lookup):
         ('Dimitri', 'Ukrainian'),
         ('Fabian', 'German'),
         ('Edgar', 'Japanese')]
-
-
-@schema
-class Glot(dj._View):
-    definition = dj.U('name').aggr(Language(), n_languages='count(language)')
 
 
 @schema
@@ -145,7 +153,6 @@ class Trial(dj.Imported):
                               orientation=random.random()*360) for cond_idx in range(30))
 
 
-
 @schema
 class Ephys(dj.Imported):
     definition = """    # some kind of electrophysiological recording
@@ -193,7 +200,7 @@ class Image(dj.Manual):
 
 
 @schema
-class UberTrash(dj.Manual):
+class UberTrash(dj.Lookup):
     definition = """
     id : int
     ---
@@ -202,10 +209,46 @@ class UberTrash(dj.Manual):
 
 
 @schema
-class UnterTrash(dj.Manual):
+class UnterTrash(dj.Lookup):
     definition = """
     -> UberTrash
     my_id   : int
     ---
     """
     contents = [(1, 1), (1, 2)]
+
+
+@schema
+class SimpleSource(dj.Lookup):
+    definition = """
+    id : int  # id
+    """
+    contents = ((x,) for x in range(10))
+
+
+@schema
+class SigIntTable(dj.Computed):
+    definition = """
+    -> SimpleSource
+    """
+
+    def _make_tuples(self, key):
+        os.kill(os.getpid(), signal.SIGINT)
+
+
+@schema
+class SigTermTable(dj.Computed):
+    definition = """
+    -> SimpleSource
+    """
+
+    def _make_tuples(self, key):
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+@schema
+class DecimalPrimaryKey(dj.Lookup):
+    definition = """
+    id  :  decimal(4,3)
+    """
+    contents = zip((0.1, 0.25, 3.99))

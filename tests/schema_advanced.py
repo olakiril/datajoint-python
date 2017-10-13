@@ -33,8 +33,7 @@ class Person(dj.Manual):
             (12, "Nelda T. Ruggeri", "F"),
             (13, "Bryan M. Cummings", "M"),
             (14, "Sara C. Le", "F"),
-            (15, "Myron S. Jaramillo", "M")
-        ))
+            (15, "Myron S. Jaramillo", "M")))
 
 
 @schema
@@ -43,7 +42,7 @@ class Parent(dj.Manual):
     -> Person
     parent_sex  : enum('M','F')
     ---
-    parent -> Person
+    (parent) -> Person
     """
 
     def fill(self):
@@ -51,7 +50,7 @@ class Parent(dj.Manual):
         def make_parent(pid, parent):
             return dict(person_id=pid,
                         parent=parent,
-                        parent_sex=(Person() & dict(person_id=parent)).fetch['sex'][0])
+                        parent_sex=(Person() & dict(person_id=parent)).fetch('sex')[0])
 
         self.insert(make_parent(*r) for r in (
             (0, 2), (0, 3), (1, 4), (1, 5), (2, 4), (2, 5), (3, 4), (3, 7), (4, 7),
@@ -59,4 +58,50 @@ class Parent(dj.Manual):
             (9, 11), (9, 12), (10, 13), (10, 14), (11, 14), (11, 15), (12, 14), (12, 15)))
 
 
+@schema
+class Subject(dj.Manual):
+    definition = """
+    subject : int
+    ---
+    -> [unique, optional] Person
+    """
 
+
+@schema
+class Prep(dj.Manual):
+    definition = """
+    prep   : int
+    """
+
+
+@schema
+class Slice(dj.Manual):
+    definition = """
+    -> Prep
+    slice  : int
+    """
+
+
+@schema
+class Cell(dj.Manual):
+    definition = """
+    -> Slice
+    cell  : int
+    """
+
+
+@schema
+class LocalSynapse(dj.Manual):
+    definition = """  # a synapse within the slice
+    (presynaptic) -> Cell(cell)
+    (postsynaptic)-> Cell
+    """
+
+
+@schema
+class GlobalSynapse(dj.Manual):
+    definition = """
+    # a synapse within the slice
+    (pre_slice, pre_cell) -> Cell(slice, cell)
+    (post_slice, post_cell)-> Cell(slice, cell)
+    """

@@ -14,20 +14,17 @@ Please cite:
 
 import logging
 import os
+from types import ModuleType
+from .version import __version__
 
-__author__ = "Dimitri Yatsenko, Edgar Walker, and Fabian Sinz at Baylor College of Medicine"
-__version__ = "0.4.1"
-__date__ = "Oct 28, 2016"
+__author__ = "Dimitri Yatsenko, Edgar Y. Walker, and Fabian Sinz at Baylor College of Medicine"
+__date__ = "July 26, 2017"
 __all__ = ['__author__', '__version__',
            'config', 'conn', 'kill', 'BaseRelation',
            'Connection', 'Heading', 'FreeRelation', 'Not', 'schema',
-           'Manual', 'Lookup', 'Imported', 'Computed', 'Part', '_View',
+           'Manual', 'Lookup', 'Imported', 'Computed', 'Part',
            'AndList', 'OrList', 'ERD', 'U',
            'set_password']
-
-print('DataJoint', __version__, '('+__date__+')')
-
-logging.captureWarnings(True)
 
 
 class key:
@@ -46,32 +43,22 @@ class DataJointError(Exception):
 # ----------- loads local configuration from file ----------------
 from .settings import Config, LOCALCONFIG, GLOBALCONFIG, logger, log_levels
 config = Config()
-
-
-if os.getenv('DJ_HOST') is not None and os.getenv('DJ_USER') is not None and os.getenv('DJ_PASS') is not None:  # pragma: no cover
-    print("Loading local settings from environment variables")
-    config['database.host'] = os.getenv('DJ_HOST')
-    config['database.user'] = os.getenv('DJ_USER')
-    config['database.password'] = os.getenv('DJ_PASS')
-elif os.path.exists(LOCALCONFIG):  # pragma: no cover
-    local_config_file = os.path.expanduser(LOCALCONFIG)
-    print("Loading local settings from {0:s}".format(local_config_file))
-    logger.log(logging.INFO, "Loading local settings from {0:s}".format(local_config_file))
-    config.load(local_config_file)
-elif os.path.exists(os.path.expanduser('~/') + GLOBALCONFIG):  # pragma: no cover
-    local_config_file = os.path.expanduser('~/') + GLOBALCONFIG
-    print("Loading local settings from {0:s}".format(local_config_file))
-    logger.log(logging.INFO, "Loading local settings from {0:s}".format(local_config_file))
-    config.load(local_config_file)
+config_files = (os.path.expanduser(n) for n in (LOCALCONFIG, os.path.join('~', GLOBALCONFIG)))
+try:
+    config_file = next(n for n in config_files if os.path.exists(n))
+except StopIteration:
+    config.add_history('No config file found, using default settings.')
 else:
-    print("""Cannot find configuration settings. Using default configuration. To change that, either
-    * modify the local copy of %s that datajoint just saved for you
-    * put a file named %s with the same configuration format in your home
-    * specify the environment variables DJ_USER, DJ_HOST, DJ_PASS
-          """ % (LOCALCONFIG, GLOBALCONFIG))
-    local_config_file = os.path.expanduser(LOCALCONFIG)
-    logger.log(logging.INFO, "No config found. Generating {0:s}".format(local_config_file))
-    config.save(local_config_file)
+    config.load(config_file)
+
+# override login credentials with environment variables
+mapping = {k: v for k, v in zip(
+    ('database.host', 'database.user', 'database.password'),
+    map(os.getenv, ('DJ_HOST', 'DJ_USER', 'DJ_PASS')))
+           if v is not None}
+for k in mapping:
+    config.add_history('Updated login credentials from %s' % k)
+config.update(mapping)
 
 logger.setLevel(log_levels[config['loglevel']])
 
@@ -79,9 +66,24 @@ logger.setLevel(log_levels[config['loglevel']])
 from .connection import conn, Connection
 from .base_relation import FreeRelation, BaseRelation
 from .user_relations import Manual, Lookup, Imported, Computed, Part
-from .view import _View
 from .relational_operand import Not, AndList, OrList, U
 from .heading import Heading
 from .schema import Schema as schema
 from .erd import ERD
 from .admin import set_password, kill
+
+
+def create_virtual_module(modulename, dbname):
+    """
+    Creates a python module with the given name from a database name in mysql with datajoint tables.
+    Automatically creates the classes of the appropriate tier in the module.
+
+    :param modulename: desired name of the module
+    :param dbname:     name of the database in mysql
+    :return: the python module
+    """
+    mod = ModuleType(modulename)
+    s = schema(dbname, mod.__dict__)
+    s.spawn_missing_classes()
+    mod.__dict__['schema'] = s
+    return mod

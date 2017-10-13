@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import re
 import datetime
+import decimal
 from . import DataJointError, config
 from .fetch import Fetch, Fetch1
 
@@ -29,7 +30,7 @@ def restricts_to_empty(arg):
     """
     returns True if restriction with arg must produce the empty relation.
     """
-    or_lists = (list, set, tuple, np.ndarray, RelationalOperand)
+    or_lists = (list, set, tuple, np.ndarray)
     return (arg is None or (isinstance(arg, AndList) and any(restricts_to_empty(r) for r in arg)) or
             arg is None or arg is False or equal_ignore_case(arg, "FALSE") or
             isinstance(arg, or_lists) and len(arg) == 0 or  # empty OR-list equals FALSE
@@ -47,7 +48,9 @@ class AndList(list):
     is equivalent to
     rel2 = rel & cond1 & cond2 & cond3
     """
-    pass
+
+    def simplify(self):
+        return self[0] if len(self) == 1 else self
 
 
 class OrList(list):
@@ -81,20 +84,17 @@ class RelationalOperand:
             # initialize
             self._restrictions = AndList()
             self._distinct = False
+            self._heading = None
         else:  # copy
             assert isinstance(arg, RelationalOperand), 'Cannot make RelationalOperand from %s' % arg.__class__.__name__
             self._restrictions = AndList(arg._restrictions)
             self._distinct = arg.distinct
+            self._heading = arg._heading
 
     @classmethod
     def create(cls):  # pragma: no cover
         """abstract method for creating an instance"""
         assert False, "Abstract method `create` must be overridden in subclass."
-
-    @property
-    def select_fields(self):  # pragma: no cover
-        """abstract property: a string specifying the field list in SQL queries"""
-        assert False, "Abstract property `select_fields` must be overridden in subclass."
 
     @property
     def connection(self):
@@ -136,32 +136,33 @@ class RelationalOperand:
         """
         convert self.restrictions to the SQL WHERE clause
         """
+
         def make_condition(arg, _negate=False):
             if isinstance(arg, str):
                 return arg, _negate
             elif isinstance(arg, AndList):
                 return '(' + ' AND '.join([make_condition(element)[0] for element in arg]) + ')', _negate
-            #  semijoin or antijoin
+            # semijoin or antijoin
             elif isinstance(arg, RelationalOperand):
                 common_attributes = [q for q in self.heading.names if q in arg.heading.names]
                 if not common_attributes:
                     condition = 'FALSE' if _negate else 'TRUE'
                 else:
-                    common_attributes = '`' + '`,`'.join(common_attributes) + '`'
                     condition = '({fields}) {not_}in ({subquery})'.format(
-                        fields=common_attributes,
+                        fields='`' + '`,`'.join(common_attributes) + '`',
                         not_="not " if _negate else "",
                         subquery=arg.make_sql(common_attributes))
                 return condition, False  # _negate is cleared
 
             # mappings are turned into ANDed equality conditions
             elif isinstance(arg, collections.abc.Mapping):
-                condition = ['`%s`=%r' %
-                             (k, v if not isinstance(v, (datetime.date, datetime.datetime, datetime.time)) else str(v))
+                condition = ['`%s`=%r' % (k, (v if not isinstance(v, (
+                    datetime.date, datetime.datetime, datetime.time, decimal.Decimal)) else str(v)))
                              for k, v in arg.items() if k in self.heading]
             elif isinstance(arg, np.void):
                 # element of a record array
-                condition = ['`%s`=%r' % (k, arg[k]) for k in arg.dtype.fields if k in self.heading]
+                condition = [('`%s`='+('%s' if self.heading[k].numeric else '"%s"')) % (k, arg[k])
+                             for k in arg.dtype.fields if k in self.heading]
             else:
                 raise DataJointError('Invalid restriction type')
             return ' AND '.join(condition) if condition else 'TRUE', _negate
@@ -186,12 +187,11 @@ class RelationalOperand:
             conditions.append(('NOT (%s)' if negate else '(%s)') % item)
         return ' WHERE ' + ' AND '.join(conditions)
 
-    @property
-    def select_fields(self):
+    def get_select_fields(self, select_fields=None):
         """
         :return: string specifying the attributes to return
         """
-        return self.heading.as_sql
+        return self.heading.as_sql if select_fields is None else self.heading.project(select_fields).as_sql
 
     # --------- relational operators -----------
 
@@ -199,7 +199,7 @@ class RelationalOperand:
         """
         natural join of relations self and other
         """
-        return other*self if isinstance(other, U) else Join.create(self, other)
+        return other * self if isinstance(other, U) else Join.create(self, other)
 
     def proj(self, *attributes, **named_attributes):
         """
@@ -214,8 +214,7 @@ class RelationalOperand:
         self.proj(a='(id)') adds a new computed field named 'a' that has the same value as id
         Each attribute can only be used once in attributes or named_attributes.
         """
-        ret = Projection.create(self, attributes, named_attributes)
-        return ret
+        return Projection.create(self, attributes, named_attributes)
 
     def aggregate(self, group, *attributes, keep_all_rows=False, **named_attributes):
         """
@@ -229,7 +228,7 @@ class RelationalOperand:
         return GroupBy.create(self, group, keep_all_rows=keep_all_rows,
                               attributes=attributes, named_attributes=named_attributes)
 
-    aggr = aggregate    # shorthand
+    aggr = aggregate  # shorthand
 
     def __iand__(self, restriction):
         """
@@ -246,7 +245,7 @@ class RelationalOperand:
         :return: a restricted copy of the argument
         See relational_operand.restrict for more detail.
         """
-        return (Subquery.create(self)    # the HAVING clause in GroupBy can handle renamed attributes but WHERE cannot
+        return (Subquery.create(self)  # the HAVING clause in GroupBy can handle renamed attributes but WHERE cannot
                 if self.heading.expressions and not isinstance(self, GroupBy)
                 else self.__class__(self)).restrict(restriction)
 
@@ -344,52 +343,122 @@ class RelationalOperand:
     def __repr__(self):
         return super().__repr__() if config['loglevel'].lower() == 'debug' else self.preview()
 
-    def preview(self):
+    def preview(self, limit=None, width=None):
         """
         returns a preview of the contents of the relation.
         """
         rel = self.proj(*self.heading.non_blobs,
                         **dict(zip_longest(self.heading.blobs, [], fillvalue="'<BLOB>'")))  # replace blobs with <BLOB>
-        limit = config['display.limit']
-        width = config['display.width']
-        tuples = rel.fetch(limit=limit)
+        if limit is None:
+            limit = config['display.limit']
+        if width is None:
+            width = config['display.width']
+        tuples = rel.fetch(limit=limit+1)
+        has_more = len(tuples) > limit
+        tuples = tuples[:limit]
         columns = rel.heading.names
-        widths = {f: min(max([len(f)] + [len(str(e)) for e in tuples[f]])+4, width) for f in columns}
+        widths = {f: min(max([len(f)] + [len(str(e)) for e in tuples[f]]) + 4, width) for f in columns}
         templates = {f: '%%-%d.%ds' % (widths[f], widths[f]) for f in columns}
         return (
-            ' '.join([templates[f] % ('*'+f if f in rel.primary_key else f) for f in columns]) + '\n' +
+            ' '.join([templates[f] % ('*' + f if f in rel.primary_key else f) for f in columns]) + '\n' +
             ' '.join(['+' + '-' * (widths[column] - 2) + '+' for column in columns]) + '\n' +
             '\n'.join(' '.join(templates[f] % tup[f] for f in columns) for tup in tuples) +
-            ('\n...\n' if len(rel) > limit else '\n') +
-            ' (%d tuples)\n' % len(rel))
+            ('\n   ...\n' if has_more else '\n') +
+            (' (%d tuples)\n' % len(rel) if config['display.show_tuple_count'] else ''))
 
     def _repr_html_(self):
         rel = self.proj(*self.heading.non_blobs,
                         **dict(zip_longest(self.heading.blobs, [], fillvalue="'=BLOB='")))  # replace blobs with =BLOB=
         info = self.heading.table_info
-        count = len(rel)
-        return """ {title}
+        tuples = rel.fetch(limit=config['display.limit']+1)
+        has_more = len(tuples) > config['display.limit']
+        tuples = tuples[0:config['display.limit']]
+
+        css = """
+        <style type="text/css">
+            .Relation{
+                border-collapse:collapse;
+            }
+            .Relation th{
+                background: #A0A0A0; color: #ffffff; padding:4px; border:#f0e0e0 1px solid;
+                font-weight: normal; font-family: monospace; font-size: 75%;
+            }
+            .Relation td{
+                padding:4px; border:#f0e0e0 1px solid; font-size:75%;
+            }
+            .Relation tr:nth-child(odd){
+                background: #ffffff;
+            }
+            .Relation tr:nth-child(even){
+                background: #f3f1ff;
+            }
+            /* Tooltip container */
+            .djtooltip {
+            }
+
+            /* Tooltip text */
+            .djtooltip .djtooltiptext {
+                visibility: hidden;
+                width: 120px;
+                background-color: black;
+                color: #fff;
+                text-align: center;
+                padding: 5px 0;
+                border-radius: 6px;
+
+                /* Position the tooltip text - see examples below! */
+                position: absolute;
+                z-index: 1;
+            }
+
+
+            #primary {
+                font-weight: bold;
+                color: black;
+            }
+
+            #nonprimary {
+                font-weight: normal;
+                color: white;
+            }
+
+            /* Show the tooltip text when you mouse over the tooltip container */
+            .djtooltip:hover .djtooltiptext {
+                visibility: visible;
+            }
+        </style>
+        """
+        head_template = """<div class="djtooltip">
+                                <p id="{primary}">{column}</p>
+                                <span class="djtooltiptext">{comment}</span>
+                            </div>"""
+
+        return """
+        {css}
+        {title}
             <div style="max-height:1000px;max-width:1500px;overflow:auto;">
-            <table border="1" class="dataframe">
+            <table border="1" class="Relation">
                 <thead> <tr style="text-align: right;"> <th> {head} </th> </tr> </thead>
                 <tbody> <tr> {body} </tr> </tbody>
             </table>
             {ellipsis}
-            <p>{count} tuples</p></div>
+            {count}</div>
             """.format(
-            title="" if info is None else "<h3>%s</h3>" % info['comment'],
-            head='</th><th>'.join("<em>" + c + "</em>" if c in self.primary_key else c
-                                  for c in rel.heading.names),
-            ellipsis='<p>...</p>' if count > config['display.limit'] else '',
+            css=css,
+            title="" if info is None else "<b>%s</b>" % info['comment'],
+            head='</th><th>'.join(
+                head_template.format(column=c, comment=rel.heading.attributes[c].comment,
+                                     primary='primary' if c in self.primary_key else 'nonprimary') for c in
+                rel.heading.names),
+            ellipsis='<p>...</p>' if has_more else '',
             body='</tr><tr>'.join(
                 ['\n'.join(['<td>%s</td>' % column for column in tup])
-                 for tup in rel.fetch(limit=config['display.limit'])]),
-            count=count)
+                 for tup in tuples]),
+            count=('<p>%d tuples</p>' % len(rel)) if config['display.show_tuple_count'] else '')
 
     def make_sql(self, select_fields=None):
         return 'SELECT {fields} FROM {from_}{where}'.format(
-            fields=select_fields or (
-                ("DISTINCT " if self.distinct and self.primary_key else "") + self.select_fields),
+            fields=("DISTINCT " if self.distinct else "") + self.get_select_fields(select_fields),
             from_=self.from_clause,
             where=self.where_clause)
 
@@ -397,9 +466,7 @@ class RelationalOperand:
         """
         number of tuples in the relation.
         """
-        return self.connection.query(self.make_sql('count(%s)' % (
-            "DISTINCT `%s`" % '`,`'.join(self.primary_key)
-            if self.distinct and self.primary_key else "*"))).fetchone()[0]
+        return U().aggr(self, n='count(*)').fetch1('n')
 
     def __bool__(self):
         """
@@ -413,7 +480,7 @@ class RelationalOperand:
         :param item: any restriction
         (item in relation) is equivalent to bool(self & item) but may be executed more efficiently.
         """
-        return bool(self & item)   # May be optimized e.g. using an EXISTS query
+        return bool(self & item)  # May be optimized e.g. using an EXISTS query
 
     def cursor(self, offset=0, limit=None, order_by=None, as_dict=False):
         """
@@ -516,20 +583,23 @@ class Projection(RelationalOperand):
         :param include_primary_key:  True if the primary key must be included even if it's not in attributes.
         :return: the resulting Projection object
         """
+        # TODO:  revisit the handling of the primary key when not include_primary_key
         obj = cls()
         obj._connection = arg.connection
         named_attributes = {k: v.strip() for k, v in named_attributes.items()}  # clean up values
         obj._distinct = arg.distinct
-        if include_primary_key:   # include primary key of relation
+        if include_primary_key:  # include primary key of relation
             attributes = (list(a for a in arg.primary_key if a not in named_attributes.values()) +
                           list(a for a in attributes if a not in arg.primary_key))
         else:
             # make distinct if the primary key is not completely selected
             obj._distinct = obj._distinct or not set(arg.primary_key).issubset(
                 set(attributes) | set(named_attributes.values()))
-        if cls._need_subquery(arg, attributes, named_attributes):
+        if obj._distinct or cls._need_subquery(arg, attributes, named_attributes):
             obj._arg = Subquery.create(arg)
             obj._heading = obj._arg.heading.project(attributes, named_attributes)
+            if not include_primary_key:
+                obj._heading = obj._heading.extend_primary_key(attributes)
         else:
             obj._arg = arg
             obj._heading = obj._arg.heading.project(attributes, named_attributes)
@@ -541,10 +611,10 @@ class Projection(RelationalOperand):
         """
         Decide whether the projection argument needs to be wrapped in a subquery
         """
-        if arg.heading.expressions:  # argument has any renamed (computed) attributes
+        if arg.heading.expressions or arg.distinct:  # argument has any renamed (computed) attributes
             return True
         restricting_attributes = arg.attributes_in_restriction()
-        return (not restricting_attributes.issubset(attributes) or # if any restricting attribute is projected out or
+        return (not restricting_attributes.issubset(attributes) or  # if any restricting attribute is projected out or
                 any(v.strip() in restricting_attributes for v in named_attributes.values()))  # or renamed
 
     @property
@@ -576,7 +646,7 @@ class GroupBy(RelationalOperand):
             raise DataJointError('a relation can only be joined with another relation')
         obj = cls()
         obj._keep_all_rows = keep_all_rows
-        if not(set(group.primary_key) - set(arg.primary_key) or set(group.primary_key) == set(arg.primary_key)):
+        if not (set(group.primary_key) - set(arg.primary_key) or set(group.primary_key) == set(arg.primary_key)):
             raise DataJointError(
                 'The aggregated relation should have additional fields in its primary key for aggregation to work')
         obj._arg = (Join.make_argument_subquery(group) if isinstance(arg, U)
@@ -591,7 +661,7 @@ class GroupBy(RelationalOperand):
 
     def make_sql(self, select_fields=None):
         return 'SELECT {fields} FROM {from_}{where} GROUP  BY `{group_by}`{having}'.format(
-            fields=select_fields or self.select_fields,
+            fields=self.get_select_fields(select_fields),
             from_=self._arg.from_clause,
             where=self._arg.where_clause,
             group_by='`,`'.join(self.primary_key),
@@ -638,9 +708,8 @@ class Subquery(RelationalOperand):
     def from_clause(self):
         return '(' + self._arg.make_sql() + ') as `_s%x`' % self.counter
 
-    @property
-    def select_fields(self):
-        return '*'
+    def get_select_fields(self, select_fields=None):
+        return '*' if select_fields is None else self.heading.project(select_fields).as_sql
 
 
 class U:
@@ -735,7 +804,6 @@ class U:
         :param named_attributes: computations of the form new_attribute="sql expression on attributes of group"
         :return: The new relation
         """
-
         return (
             GroupBy.create(self, group=group, keep_all_rows=False, attributes=(), named_attributes=named_attributes)
             if self.primary_key else

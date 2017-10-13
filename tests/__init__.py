@@ -5,24 +5,22 @@ exists. The content of the test database will be destroyed
 after the test.
 """
 
-__author__ = 'Edgar Walker, Fabian Sinz, Dimitri Yatsenko'
-
 import logging
 from os import environ
+import datajoint as dj
+
+__author__ = 'Edgar Walker, Fabian Sinz, Dimitri Yatsenko'
 
 # turn on verbose logging
 logging.basicConfig(level=logging.DEBUG)
 
-import datajoint as dj
-
 __all__ = ['__author__', 'PREFIX', 'CONN_INFO']
-
 
 # Connection for testing
 CONN_INFO = dict(
     host=environ.get('DJ_TEST_HOST', 'localhost'),
     user=environ.get('DJ_TEST_USER', 'datajoint'),
-    passwd=environ.get('DJ_TEST_PASSWORD', 'datajoint'))
+    password=environ.get('DJ_TEST_PASSWORD', 'datajoint'))
 
 # Prefix for all databases used during testing
 PREFIX = environ.get('DJ_TEST_DB_PREFIX', 'djtest')
